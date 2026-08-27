@@ -1,0 +1,18 @@
+# Optional Cloud Commander reverse proxy for RVA
+# Adjust the path and listener to match your environment.
+
+ProxyPreserveHost On
+
+RewriteEngine On
+RewriteCond %{HTTP:Upgrade} =websocket [NC]
+RewriteRule ^/cloudcmd/(.*)$ ws://127.0.0.1:8000/cloudcmd/$1 [P,L]
+
+ProxyPass        /cloudcmd/ http://127.0.0.1:8000/cloudcmd/ retry=0
+ProxyPassReverse /cloudcmd/ http://127.0.0.1:8000/cloudcmd/
+
+<Location /cloudcmd/>
+    ProxyPassReverseCookiePath / /cloudcmd/
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set Referrer-Policy "same-origin"
+</Location>
