@@ -1,0 +1,30 @@
+# RVA runtime configuration
+# Copy to /etc/rva/rva.conf and adjust for your environment.
+
+# Network interfaces
+ADMIN_IF=eth0
+SPAN_IF=span0
+
+# Optional administrative network validation
+ADMIN_IP=
+ADMIN_GW=
+
+# VoIPmonitor
+VOIPMONITOR_BIN=/usr/local/sbin/voipmonitor
+VOIPMONITOR_CONF=/etc/voipmonitor.conf
+SPOOL_ROOT=/var/spool/voipmonitor
+
+# Database client configuration
+DB_CNF=/etc/rva/database.cnf
+DB_NAME=voipmonitor
+
+# Optional file-browser integration
+CLOUDCMD_USER=cloudcmd
+CLOUDCMD_URL=http://127.0.0.1:8000/cloudcmd/
+RVA_PROXY_URL=http://127.0.0.1/cloudcmd/
+
+# Healthcheck tuning
+RECENT_CDR_MINUTES=180
+SPAN_TRAFFIC_TIMEOUT=5
+SPOOL_WARN_PERCENT=80
+SPOOL_FAIL_PERCENT=90
