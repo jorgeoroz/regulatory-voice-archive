@@ -5,6 +5,7 @@
 # Usage:
 #   sudo ./install/install.sh
 #   sudo ./install/install.sh --check
+#   sudo ./install/install.sh --with-prerequisites
 #   sudo ./install/install.sh --with-mariadb
 #   sudo ./install/install.sh --with-cloudcmd
 #   sudo ./install/install.sh --with-apache
@@ -22,11 +23,13 @@ readonly RVA_ETC="/etc/rva"
 readonly RVA_BIN="/usr/local/sbin"
 readonly RVA_CONF="${RVA_ETC}/rva.conf"
 readonly DB_CNF="${RVA_ETC}/database.cnf"
+readonly PREREQ_INSTALLER="${PROJECT_ROOT}/install/install-prerequisites.sh"
 readonly CLOUDCMD_HOME="/var/lib/cloudcmd"
 readonly CLOUDCMD_CONF="${CLOUDCMD_HOME}/.cloudcmd.json"
 readonly CLOUDCMD_SERVICE="/etc/systemd/system/cloudcmd.service"
 readonly APACHE_CONF="/etc/apache2/conf-available/rva-cloudcmd.conf"
 
+WITH_PREREQUISITES=0
 WITH_MARIADB=0
 WITH_CLOUDCMD=0
 WITH_APACHE=0
@@ -74,12 +77,13 @@ Usage:
   sudo ./install/install.sh [option ...]
 
 Options:
-  --check             Validate the server only. Do not modify anything.
-  --with-mariadb      Install/enable MariaDB and prepare the RVA DB client.
-  --with-cloudcmd     Install/configure Cloud Commander as an optional file browser.
-  --with-apache       Install/configure Apache reverse proxy integration.
-  --with-all          Enable MariaDB + Cloud Commander + Apache installation.
-  -h, --help          Show this help.
+  --check                 Validate the server only. Do not modify anything.
+  --with-prerequisites    Install RVA runtime prerequisites and validate G.729 support.
+  --with-mariadb          Install/enable MariaDB and prepare the RVA DB client.
+  --with-cloudcmd         Install/configure Cloud Commander as an optional file browser.
+  --with-apache           Install/configure Apache reverse proxy integration.
+  --with-all              Install prerequisites + MariaDB + Cloud Commander + Apache.
+  -h, --help              Show this help.
 
 Without optional flags, the installer only deploys RVA configuration templates
 and commands. Existing configuration files are never overwritten automatically.
@@ -178,6 +182,18 @@ check_environment() {
     else
         warn "Cloud Commander not installed (optional)"
     fi
+}
+
+install_prerequisites_component() {
+    section "RVA PREREQUISITES"
+
+    [[ -f "$PREREQ_INSTALLER" ]] \
+        || die "Missing prerequisite installer: $PREREQ_INSTALLER"
+
+    bash -n "$PREREQ_INSTALLER"
+    info "Installing RVA runtime prerequisites"
+    bash "$PREREQ_INSTALLER"
+    ok "RVA prerequisite installer completed"
 }
 
 install_base_rva() {
@@ -347,9 +363,6 @@ install_cloudcmd_component() {
         --save \
         --no-server >/dev/null
 
-    # Cloud Commander 19.x stores the password as a hash after --save.
-    # Force loopback binding and the classic context menu without exposing
-    # the clear-text password in the JSON configuration.
     node - "$CLOUDCMD_CONF" <<'NODE'
 const fs = require('fs');
 const file = process.argv[2];
@@ -493,6 +506,9 @@ parse_args() {
             --check)
                 CHECK_ONLY=1
                 ;;
+            --with-prerequisites)
+                WITH_PREREQUISITES=1
+                ;;
             --with-mariadb)
                 WITH_MARIADB=1
                 ;;
@@ -503,6 +519,7 @@ parse_args() {
                 WITH_APACHE=1
                 ;;
             --with-all)
+                WITH_PREREQUISITES=1
                 WITH_MARIADB=1
                 WITH_CLOUDCMD=1
                 WITH_APACHE=1
@@ -529,17 +546,24 @@ main() {
     printf '========================================\n'
 
     if (( CHECK_ONLY )); then
+        if [[ -f "$PREREQ_INSTALLER" ]]; then
+            bash "$PREREQ_INSTALLER" --check || true
+        fi
         check_environment
         summary
         return $?
+    fi
+
+    if (( WITH_PREREQUISITES )); then
+        install_prerequisites_component
     fi
 
     if (( WITH_MARIADB )); then
         install_mariadb_component
     fi
 
-    # Install core after MariaDB so --with-mariadb can safely create the
-    # database client configuration that core would otherwise template.
+    # Install core after prerequisite/database work so templates do not
+    # overwrite component-specific configuration created earlier.
     install_base_rva
     load_runtime_config
 
