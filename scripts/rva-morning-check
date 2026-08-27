@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+
+set -u
+
+CONFIG_FILE="${RVA_CONFIG:-/etc/rva/rva.conf}"
+[[ -r "$CONFIG_FILE" ]] && # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+DB_CNF="${DB_CNF:-/etc/rva/database.cnf}"
+DB_NAME="${DB_NAME:-voipmonitor}"
+
+[[ -r "$DB_CNF" ]] || { echo "[FAIL] No se puede leer $DB_CNF"; exit 2; }
+
+if ! mariadb --defaults-extra-file="$DB_CNF" --batch --skip-column-names -e 'SELECT 1;' >/dev/null 2>&1; then
+    echo "[FAIL] No se pudo conectar a MariaDB"
+    exit 2
+fi
+
+show_day() {
+    local title="$1" day="$2" count
+
+    echo "----------------------------------------------------------------------------------------------------------------"
+    echo " $title - $day"
+    echo "----------------------------------------------------------------------------------------------------------------"
+
+    count=$(mariadb --defaults-extra-file="$DB_CNF" --batch --skip-column-names -e "SELECT COUNT(*) FROM ${DB_NAME}.cdr WHERE calldate >= '${day} 00:00:00' AND calldate < DATE_ADD('${day}', INTERVAL 1 DAY);" 2>/dev/null)
+
+    if [ "${count:-0}" -eq 0 ]; then
+        echo " Sin llamadas registradas."
+        echo
+        return
+    fi
+
+    printf '%-10s %-17s %-20s %-20s %-10s %-20s\n' "ID" "FECHA/HORA" "CALLER" "CALLED" "DURACION" "ESTADO"
+    printf '%-10s %-17s %-20s %-20s %-10s %-20s\n' "----------" "-----------------" "--------------------" "--------------------" "----------" "--------------------"
+
+    mariadb --defaults-extra-file="$DB_CNF" --batch --skip-column-names -e "
+SELECT
+    ID,
+    DATE_FORMAT(calldate,'%Y-%m-%d %H:%i'),
+    LEFT(IFNULL(caller,''),20),
+    LEFT(IFNULL(called,''),20),
+    CONCAT(IFNULL(duration,0),'s'),
+    CASE
+        WHEN IFNULL(connect_duration,0) > 0 THEN 'CONTESTADA'
+        WHEN lastSIPresponseNum = 404 THEN 'NO ENCONTRADO'
+        WHEN lastSIPresponseNum = 408 THEN 'TIMEOUT'
+        WHEN lastSIPresponseNum = 480 THEN 'NO DISPONIBLE'
+        WHEN lastSIPresponseNum = 486 THEN 'OCUPADO'
+        WHEN lastSIPresponseNum = 487 THEN 'CANCELADA'
+        WHEN lastSIPresponseNum = 603 THEN 'RECHAZADA'
+        WHEN lastSIPresponseNum BETWEEN 200 AND 299 THEN 'COMPLETADA'
+        WHEN lastSIPresponseNum >= 400 THEN CONCAT('SIP ',lastSIPresponseNum)
+        ELSE 'NO CONTESTADA'
+    END
+FROM ${DB_NAME}.cdr
+WHERE calldate >= '${day} 00:00:00'
+  AND calldate < DATE_ADD('${day}', INTERVAL 1 DAY)
+ORDER BY calldate;
+" | while IFS=$'\t' read -r id ts caller called duration status; do
+        printf '%-10s %-17s %-20s %-20s %-10s %-20s\n' "$id" "$ts" "$caller" "$called" "$duration" "$status"
+    done
+
+    echo
+    echo " Total: $count llamada(s)"
+    echo
+}
+
+yesterday=$(date -d yesterday '+%Y-%m-%d')
+today=$(date '+%Y-%m-%d')
+
+echo
+echo "================================================================================================================"
+echo " RVA MORNING CHECK"
+echo " Fecha ejecución: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+echo " Host: $(hostname -f 2>/dev/null || hostname)"
+echo "================================================================================================================"
+echo
+
+show_day "AYER" "$yesterday"
+show_day "HOY" "$today"
+
+yesterday_count=$(mariadb --defaults-extra-file="$DB_CNF" --batch --skip-column-names -e "SELECT COUNT(*) FROM ${DB_NAME}.cdr WHERE calldate >= '${yesterday} 00:00:00' AND calldate < '${today} 00:00:00';")
+today_count=$(mariadb --defaults-extra-file="$DB_CNF" --batch --skip-column-names -e "SELECT COUNT(*) FROM ${DB_NAME}.cdr WHERE calldate >= '${today} 00:00:00' AND calldate < DATE_ADD('${today}', INTERVAL 1 DAY);")
+
+echo "================================================================================================================"
+echo " RESUMEN"
+echo "================================================================================================================"
+echo " Ayer:  $yesterday_count"
+echo " Hoy:   $today_count"
+echo " Total: $((yesterday_count + today_count))"
+echo "================================================================================================================"
