@@ -14,6 +14,7 @@ RVA adds an operational and user-facing layer on top of VoIPmonitor for call rev
 - System and service health checks
 - Optional Cloud Commander integration
 - Portable configuration under `/etc/rva`
+- Modular installer with prerequisite, MariaDB, Cloud Commander, and Apache options
 - Installation and hardening documentation
 
 ## Planned scope — v0.2.0
@@ -55,6 +56,7 @@ Core requirements:
 - Bash
 - TShark
 - FFmpeg with G.729 decoder support
+- tcpdump
 - `xxd`
 - `flock`
 - ACL utilities (`setfacl`)
@@ -63,11 +65,88 @@ Useful/optional components:
 
 - Apache HTTP Server
 - Cloud Commander
-- tcpdump
 - rrdtool
 - ethtool
 - zstd
 - unzip
+
+## Installation
+
+RVA provides a modular installer so administrators can validate the environment first and opt in only to the components they want RVA to configure.
+
+Check the server without making changes:
+
+```bash
+sudo ./install/install.sh --check
+```
+
+Install only the RVA core files:
+
+```bash
+sudo ./install/install.sh
+```
+
+Install and validate runtime prerequisites:
+
+```bash
+sudo ./install/install.sh --with-prerequisites
+```
+
+Install individual optional components:
+
+```bash
+sudo ./install/install.sh --with-mariadb
+sudo ./install/install.sh --with-cloudcmd
+sudo ./install/install.sh --with-apache
+```
+
+Run the full supported installation flow:
+
+```bash
+sudo ./install/install.sh --with-all
+```
+
+`--with-all` runs the installation in this order:
+
+```text
+Prerequisites
+    ↓
+MariaDB
+    ↓
+RVA Core
+    ↓
+Cloud Commander
+    ↓
+Apache
+    ↓
+Final validation
+```
+
+### Installer options
+
+| Option | Purpose |
+| --- | --- |
+| `--check` | Validate the server only. No configuration changes are made. |
+| `--with-prerequisites` | Install and validate RVA runtime tools such as TShark, FFmpeg/FFprobe, tcpdump, ACL utilities, `flock`, `xxd`, rrdtool, ethtool, zstd, unzip, and related command-line dependencies. |
+| `--with-mariadb` | Install/enable MariaDB and prepare RVA database client access. |
+| `--with-cloudcmd` | Install/configure Cloud Commander as an optional file browser. |
+| `--with-apache` | Install/configure Apache and the Cloud Commander reverse proxy integration. |
+| `--with-all` | Run prerequisites + MariaDB + RVA core + Cloud Commander + Apache + final validation. |
+
+The prerequisite installer can also be run directly:
+
+```bash
+sudo ./install/install-prerequisites.sh --check
+sudo ./install/install-prerequisites.sh
+```
+
+Use the built-in help for the current command reference:
+
+```bash
+sudo ./install/install.sh --help
+```
+
+See `docs/installation.md` for the complete installation guide and manual installation path.
 
 ## Configuration
 
