@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 027
+
+CONFIG_FILE="${RVA_CONFIG:-/etc/rva/rva.conf}"
+[[ -r "$CONFIG_FILE" ]] && # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+DB_CNF="${DB_CNF:-/etc/rva/database.cnf}"
+DB_NAME="${DB_NAME:-voipmonitor}"
+SPOOL_ROOT="${SPOOL_ROOT:-/var/spool/voipmonitor}"
+VOIPMONITOR_BIN="${VOIPMONITOR_BIN:-/usr/local/sbin/voipmonitor}"
+CLOUDCMD_USER="${CLOUDCMD_USER:-cloudcmd}"
+
+FORCE=0
+CDR_ID=""
+
+log()  { printf '[INFO] %s\n' "$*"; }
+ok()   { printf '[ OK ] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Uso:
+  sudo rva-genera-wav <ID_CDR>
+  sudo rva-genera-wav <ID_CDR> --force
+EOF
+}
+
+cleanup() {
+    if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR:-}" ]]; then
+        rm -rf -- "$TMP_DIR"
+    fi
+}
+
+trap cleanup EXIT
+trap 'die "Ejecución interrumpida en la línea $LINENO."' ERR
+
+[[ $EUID -eq 0 ]] || die "Ejecuta este script con sudo."
+
+for arg in "$@"; do
+    case "$arg" in
+        --force) FORCE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *)
+            if [[ -z "$CDR_ID" ]]; then CDR_ID="$arg"; else die "Argumento no reconocido: $arg"; fi
+            ;;
+    esac
+done
+
+[[ -n "$CDR_ID" ]] || { usage; exit 2; }
+[[ "$CDR_ID" =~ ^[0-9]+$ ]] || die "El ID debe ser un número entero positivo."
+(( CDR_ID > 0 )) || die "El ID debe ser mayor que cero."
+
+for cmd in mariadb tshark ffmpeg ffprobe setfacl flock awk tr xxd; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Falta el comando requerido: $cmd"
+done
+
+[[ -x "$VOIPMONITOR_BIN" ]] || die "No existe o no es ejecutable: $VOIPMONITOR_BIN"
+[[ -r "$DB_CNF" ]] || die "No se puede leer: $DB_CNF"
+[[ -d "$SPOOL_ROOT" ]] || die "No existe el spool: $SPOOL_ROOT"
+
+if id "$CLOUDCMD_USER" >/dev/null 2>&1; then
+    HAVE_CLOUDCMD_USER=1
+else
+    HAVE_CLOUDCMD_USER=0
+fi
+
+exec 9>"/run/lock/rva-genera-wav-${CDR_ID}.lock"
+flock -n 9 || die "Ya existe otra generación en proceso para el CDR ID $CDR_ID."
+
+db_query() {
+    mariadb --defaults-extra-file="$DB_CNF" --batch --raw --skip-column-names --database="$DB_NAME" -e "$1"
+}
+
+log "Consultando CDR ID $CDR_ID..."
+
+CALL_SQL="
+SELECT
+    cdr.ID,
+    DATE_FORMAT(cdr.calldate, '%Y-%m-%d %H:%i:%s.%f'),
+    DATE_FORMAT(cdr.calldate, '%Y-%m-%d'),
+    DATE_FORMAT(cdr.calldate, '%H'),
+    DATE_FORMAT(cdr.calldate, '%i'),
+    cdr.caller,
+    cdr.called,
+    IFNULL(cdr.connect_duration, ''),
+    IFNULL(cdr.lastSIPresponseNum, ''),
+    IFNULL(cdr.payload, ''),
+    IFNULL(cdr_next.fbasename, '')
+FROM cdr
+INNER JOIN cdr_next
+    ON cdr_next.cdr_ID = cdr.ID
+   AND cdr_next.calldate = cdr.calldate
+WHERE cdr.ID = ${CDR_ID}
+ORDER BY cdr.calldate DESC
+LIMIT 2;
+"
+
+mapfile -t CALL_ROWS < <(db_query "$CALL_SQL")
+(( ${#CALL_ROWS[@]} > 0 )) || die "No existe el CDR ID $CDR_ID."
+(( ${#CALL_ROWS[@]} == 1 )) || die "El ID $CDR_ID aparece en más de una fecha; se requiere identificar también calldate."
+
+IFS=$'\t' read -r DB_ID CALLDATE CALL_DATE CALL_HOUR CALL_MINUTE CALLER CALLED CONNECT_DURATION LAST_RESPONSE PAYLOAD FBASENAME <<< "${CALL_ROWS[0]}"
+
+[[ "$DB_ID" == "$CDR_ID" ]] || die "La consulta devolvió un ID inesperado."
+[[ -n "$FBASENAME" ]] || die "El CDR no tiene fbasename en cdr_next."
+[[ "$FBASENAME" != *"/"* && "$FBASENAME" != *$'\n'* ]] || die "fbasename contiene caracteres no permitidos."
+[[ -n "$CONNECT_DURATION" && "$CONNECT_DURATION" != "0" && "$CONNECT_DURATION" != "0.000" ]] || die "La llamada no fue contestada o no tiene audio (SIP ${LAST_RESPONSE:-N/D})."
+
+CALL_DIR="${SPOOL_ROOT}/${CALL_DATE}/${CALL_HOUR}/${CALL_MINUTE}"
+RTP_DIR="${CALL_DIR}/RTP"
+AUDIO_DIR="${CALL_DIR}/AUDIO"
+TAR_BASE="rtp_${CALL_DATE}-${CALL_HOUR}-${CALL_MINUTE}"
+RTP_MEMBER="${FBASENAME}.pcap"
+OUTPUT_WAV="${AUDIO_DIR}/${FBASENAME}.wav"
+
+[[ -d "$RTP_DIR" ]] || die "No existe la carpeta RTP: $RTP_DIR"
+
+RTP_TAR=""
+for candidate in "${RTP_DIR}/${TAR_BASE}.tar" "${RTP_DIR}/${TAR_BASE}.tar.zst" "${RTP_DIR}/${TAR_BASE}.tar.gz"; do
+    if [[ -f "$candidate" ]]; then RTP_TAR="$candidate"; break; fi
+done
+[[ -n "$RTP_TAR" ]] || die "No se encontró el TAR RTP para ${CALL_DATE} ${CALL_HOUR}:${CALL_MINUTE}."
+
+if [[ -s "$OUTPUT_WAV" && "$FORCE" -eq 0 ]]; then
+    ok "El WAV ya existe; no se regeneró."
+    printf '%s\n' "$OUTPUT_WAV"
+    exit 0
+fi
+
+POSITIONS_SQL="
+SELECT pos
+FROM cdr_tar_part
+WHERE cdr_ID = ${CDR_ID}
+  AND calldate = '${CALLDATE}'
+  AND type = 2
+ORDER BY pos;
+"
+
+mapfile -t POSITIONS_ARRAY < <(db_query "$POSITIONS_SQL")
+(( ${#POSITIONS_ARRAY[@]} > 0 )) || die "No existen posiciones RTP type=2 para el CDR ID $CDR_ID."
+POSITIONS="$(IFS=,; printf '%s' "${POSITIONS_ARRAY[*]}")"
+[[ "$POSITIONS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "Lista de posiciones RTP inválida: $POSITIONS"
+
+FLOWS_SQL="
+SELECT
+    INET_NTOA(saddr),
+    sport,
+    INET_NTOA(daddr),
+    dport,
+    ssrc,
+    payload,
+    firsttime,
+    duration,
+    received
+FROM cdr_rtp
+WHERE cdr_ID = ${CDR_ID}
+  AND calldate = '${CALLDATE}'
+ORDER BY received DESC, duration DESC
+LIMIT 2;
+"
+
+mapfile -t FLOW_ROWS < <(db_query "$FLOWS_SQL")
+(( ${#FLOW_ROWS[@]} > 0 )) || die "El CDR no tiene flujos RTP."
+
+TMP_DIR="$(mktemp -d "/tmp/rva-wav-${CDR_ID}.XXXXXX")"
+RTP_PCAP="${TMP_DIR}/rtp.pcap"
+
+log "Llamada: $CALLER -> $CALLED"
+log "Fecha: $CALLDATE"
+log "fbasename: $FBASENAME"
+log "Fragmentos RTP: ${#POSITIONS_ARRAY[@]}"
+log "Extrayendo RTP desde el TAR..."
+
+"$VOIPMONITOR_BIN" -kc --untar-gui="${RTP_TAR} ${RTP_MEMBER} ${POSITIONS} ${RTP_PCAP}" >/dev/null
+[[ -s "$RTP_PCAP" ]] || die "VoIPmonitor no generó un PCAP RTP válido."
+tshark -r "$RTP_PCAP" -c 1 >/dev/null 2>&1 || die "El PCAP RTP extraído no puede ser leído por tshark."
+ok "PCAP RTP reconstruido."
+
+declare -a SRC_IP SRC_PORT DST_IP DST_PORT SSRC FIRSTTIME RAW_G729 SIDE_WAV
+declare -a DECODE_ARGS
+declare -A PORT_SEEN
+
+for i in "${!FLOW_ROWS[@]}"; do
+    IFS=$'\t' read -r SRC_IP[$i] SRC_PORT[$i] DST_IP[$i] DST_PORT[$i] SSRC[$i] FLOW_PAYLOAD FIRSTTIME[$i] FLOW_DURATION FLOW_RECEIVED <<< "${FLOW_ROWS[$i]}"
+
+    [[ "${FLOW_PAYLOAD}" == "18" ]] || die "Códec RTP no soportado por esta versión. Payload detectado: ${FLOW_PAYLOAD:-NULL}."
+    [[ "${SRC_IP[$i]}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "IP RTP inválida."
+    [[ "${SRC_PORT[$i]}" =~ ^[0-9]+$ ]] || die "Puerto RTP inválido."
+    [[ "${DST_PORT[$i]}" =~ ^[0-9]+$ ]] || die "Puerto RTP inválido."
+    [[ "${SSRC[$i]}" =~ ^[0-9]+$ ]] || die "SSRC RTP inválido."
+
+    for port in "${SRC_PORT[$i]}" "${DST_PORT[$i]}"; do
+        if [[ -z "${PORT_SEEN[$port]:-}" ]]; then
+            DECODE_ARGS+=( -d "udp.port==${port},rtp" )
+            PORT_SEEN[$port]=1
+        fi
+    done
+
+    RAW_G729[$i]="${TMP_DIR}/lado-$((i + 1)).g729"
+    SIDE_WAV[$i]="${TMP_DIR}/lado-$((i + 1)).wav"
+done
+
+log "Separando y decodificando ${#FLOW_ROWS[@]} flujo(s) RTP..."
+
+for i in "${!FLOW_ROWS[@]}"; do
+    # Deduplicate by RTP sequence number. Mirrored/SPAN traffic can contain
+    # repeated copies of the same RTP packet; feeding duplicates to the G.729
+    # decoder produces distorted/robotic audio.
+    tshark \
+        -r "$RTP_PCAP" \
+        "${DECODE_ARGS[@]}" \
+        -Y "rtp && ip.src==${SRC_IP[$i]} && udp.srcport==${SRC_PORT[$i]} && rtp.ssrc==${SSRC[$i]}" \
+        -T fields \
+        -e rtp.seq \
+        -e rtp.payload \
+        2>/dev/null \
+        | awk -F '\t' '!seen[$1]++ {print $2}' \
+        | tr -d ':\r\n ' \
+        | xxd -r -p \
+        > "${RAW_G729[$i]}"
+
+    [[ -s "${RAW_G729[$i]}" ]] || die "No se pudo extraer el payload G.729 del flujo $((i + 1))."
+
+    ffmpeg -hide_banner -loglevel error -y \
+        -f g729 -i "${RAW_G729[$i]}" \
+        -ar 8000 -ac 1 -c:a pcm_s16le \
+        "${SIDE_WAV[$i]}"
+
+    [[ -s "${SIDE_WAV[$i]}" ]] || die "No se pudo decodificar el flujo $((i + 1))."
+done
+
+FINAL_TMP="${TMP_DIR}/final.wav"
+
+if (( ${#FLOW_ROWS[@]} == 1 )); then
+    cp -- "${SIDE_WAV[0]}" "$FINAL_TMP"
+    warn "Solo se encontró un flujo RTP; se generó un WAV de un solo sentido."
+else
+    read -r DELAY_0 DELAY_1 < <(
+        awk -v a="${FIRSTTIME[0]}" -v b="${FIRSTTIME[1]}" 'BEGIN { min=(a<b?a:b); d0=int(((a-min)*1000)+0.5); d1=int(((b-min)*1000)+0.5); printf "%d %d\n",d0,d1 }'
+    )
+
+    ffmpeg -hide_banner -loglevel error -y \
+        -i "${SIDE_WAV[0]}" \
+        -i "${SIDE_WAV[1]}" \
+        -filter_complex "[0:a]adelay=delays=${DELAY_0}:all=1[a0];[1:a]adelay=delays=${DELAY_1}:all=1[a1];[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=1[a]" \
+        -map '[a]' \
+        -ar 8000 -ac 1 -c:a pcm_s16le \
+        "$FINAL_TMP"
+fi
+
+[[ -s "$FINAL_TMP" ]] || die "No se generó el WAV final."
+
+WAV_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FINAL_TMP")
+awk -v d="$WAV_DURATION" 'BEGIN { exit !(d > 0) }' || die "El WAV final tiene duración inválida."
+
+install -d -m 0755 -o root -g root "$AUDIO_DIR"
+install -m 0640 -o root -g root "$FINAL_TMP" "${OUTPUT_WAV}.tmp"
+mv -f -- "${OUTPUT_WAV}.tmp" "$OUTPUT_WAV"
+
+if [ "$HAVE_CLOUDCMD_USER" -eq 1 ]; then
+    setfacl -m "u:${CLOUDCMD_USER}:r--" "$OUTPUT_WAV"
+fi
+
+ok "WAV generado correctamente."
+printf 'ID: %s\n' "$CDR_ID"
+printf 'Duración: %.3f segundos\n' "$WAV_DURATION"
+printf 'Archivo: %s\n' "$OUTPUT_WAV"
