@@ -1,0 +1,37 @@
+# Secrets and local configuration
+*.secret
+*.secrets
+.env
+.env.*
+config/database.cnf
+config/rva.conf
+/etc/rva/database.cnf
+
+# Sensitive voice/network artifacts
+*.wav
+*.g729
+*.pcap
+*.pcapng
+*.cap
+*.tar
+*.tar.gz
+*.tar.zst
+*.sql
+*.dump
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Debug output
+DEBUG-AUDIO/
+rva-wav-*/
+
+# IDE/editor
+.vscode/
+.idea/
