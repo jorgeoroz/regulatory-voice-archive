@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+
+set -u
+
+CONFIG_FILE="${RVA_CONFIG:-/etc/rva/rva.conf}"
+[[ -r "$CONFIG_FILE" ]] && # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+ADMIN_IF="${ADMIN_IF:-eth0}"
+SPAN_IF="${SPAN_IF:-span0}"
+ADMIN_IP="${ADMIN_IP:-}"
+ADMIN_GW="${ADMIN_GW:-}"
+VOIPMONITOR_CONF="${VOIPMONITOR_CONF:-/etc/voipmonitor.conf}"
+SPOOL_ROOT="${SPOOL_ROOT:-/var/spool/voipmonitor}"
+DB_CNF="${DB_CNF:-/etc/rva/database.cnf}"
+DB_NAME="${DB_NAME:-voipmonitor}"
+CLOUDCMD_URL="${CLOUDCMD_URL:-http://127.0.0.1:8000/cloudcmd/}"
+RVA_PROXY_URL="${RVA_PROXY_URL:-http://127.0.0.1/cloudcmd/}"
+RECENT_CDR_MINUTES="${RECENT_CDR_MINUTES:-180}"
+SPAN_TRAFFIC_TIMEOUT="${SPAN_TRAFFIC_TIMEOUT:-5}"
+SPOOL_WARN_PERCENT="${SPOOL_WARN_PERCENT:-80}"
+SPOOL_FAIL_PERCENT="${SPOOL_FAIL_PERCENT:-90}"
+
+WARN=0
+FAIL=0
+
+ok()   { printf '[ OK ] %s\n' "$1"; }
+warn() { printf '[WARN] %s\n' "$1"; WARN=$((WARN + 1)); }
+fail() { printf '[FAIL] %s\n' "$1"; FAIL=$((FAIL + 1)); }
+section() { printf '\n--- %s ---\n' "$1"; }
+
+http_check() {
+    local label="$1" url="$2" code
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
+    case "$code" in
+        200|302|401) ok "$label responde HTTP $code" ;;
+        *) fail "$label responde HTTP ${code:-N/A}" ;;
+    esac
+}
+
+printf '\n==============================================================\n'
+printf ' RVA HEALTHCHECK\n'
+printf ' Fecha: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+printf ' Host:  %s\n' "$(hostname -f 2>/dev/null || hostname)"
+printf '==============================================================\n'
+
+section "SERVICIOS"
+
+for svc in apache2 mariadb; do
+    if systemctl is-active --quiet "$svc"; then ok "Servicio $svc activo"; else fail "Servicio $svc NO está activo"; fi
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then ok "Servicio $svc habilitado al arranque"; else warn "Servicio $svc NO está habilitado al arranque"; fi
+done
+
+if systemctl list-unit-files cloudcmd.service >/dev/null 2>&1; then
+    if systemctl is-active --quiet cloudcmd; then ok "Servicio cloudcmd activo"; else warn "Servicio cloudcmd NO está activo"; fi
+    if systemctl is-enabled --quiet cloudcmd 2>/dev/null; then ok "Servicio cloudcmd habilitado al arranque"; else warn "Servicio cloudcmd NO está habilitado al arranque"; fi
+else
+    ok "Cloud Commander no instalado (opcional)"
+fi
+
+if pgrep -x voipmonitor >/dev/null 2>&1; then ok "VoIPmonitor activo"; else fail "VoIPmonitor NO está activo"; fi
+
+if systemctl list-unit-files nftables.service >/dev/null 2>&1; then
+    if systemctl is-active --quiet nftables; then ok "Servicio nftables activo"; else warn "Servicio nftables NO está activo"; fi
+fi
+
+FAILED_UNITS=$(systemctl --failed --no-legend --no-pager 2>/dev/null | grep -c . || true)
+if [ "$FAILED_UNITS" -eq 0 ]; then
+    ok "No hay unidades systemd fallidas"
+else
+    warn "systemd tiene $FAILED_UNITS unidad(es) fallida(s)"
+    systemctl --failed --no-pager
+fi
+
+section "RED"
+
+if ip link show "$ADMIN_IF" >/dev/null 2>&1; then ok "Interfaz $ADMIN_IF existe"; else fail "Interfaz $ADMIN_IF NO existe"; fi
+if ip link show "$SPAN_IF" >/dev/null 2>&1; then ok "Interfaz $SPAN_IF existe"; else fail "Interfaz $SPAN_IF NO existe"; fi
+
+if ip link show "$ADMIN_IF" 2>/dev/null | grep -q 'UP'; then ok "$ADMIN_IF está UP"; else fail "$ADMIN_IF NO está UP"; fi
+if ip link show "$SPAN_IF" 2>/dev/null | grep -q 'UP'; then ok "$SPAN_IF está UP"; else fail "$SPAN_IF NO está UP"; fi
+
+if [ -n "$ADMIN_IP" ]; then
+    if ip -4 addr show "$ADMIN_IF" 2>/dev/null | grep -q "${ADMIN_IP}/"; then ok "$ADMIN_IF tiene $ADMIN_IP"; else fail "$ADMIN_IF NO tiene IP esperada $ADMIN_IP"; fi
+fi
+
+if [ -n "$ADMIN_GW" ]; then
+    if ip route | grep -q "^default via $ADMIN_GW dev $ADMIN_IF"; then ok "Gateway por defecto correcto"; else warn "Gateway por defecto no coincide con $ADMIN_GW por $ADMIN_IF"; fi
+    if ping -c 1 -W 2 "$ADMIN_GW" >/dev/null 2>&1; then ok "Gateway $ADMIN_GW responde"; else warn "Gateway $ADMIN_GW no respondió a ICMP"; fi
+fi
+
+if ! ip -4 addr show "$SPAN_IF" 2>/dev/null | grep -q 'inet '; then ok "$SPAN_IF sin IPv4 global"; else warn "$SPAN_IF tiene IPv4 configurada"; fi
+
+section "PUERTOS Y HTTP"
+
+if ss -lnt 2>/dev/null | grep -q ':80 '; then ok "Apache escucha en puerto 80"; else fail "Apache NO escucha en puerto 80"; fi
+
+if systemctl list-unit-files cloudcmd.service >/dev/null 2>&1; then
+    if ss -lnt 2>/dev/null | grep -q ':8000 '; then ok "Cloud Commander escucha en TCP/8000"; else fail "Cloud Commander NO escucha en TCP/8000"; fi
+    http_check "Cloud Commander local" "$CLOUDCMD_URL"
+    http_check "Proxy Apache" "$RVA_PROXY_URL"
+fi
+
+section "ALMACENAMIENTO"
+
+if mountpoint -q "$SPOOL_ROOT"; then ok "$SPOOL_ROOT está montado"; else fail "$SPOOL_ROOT NO está montado"; fi
+if [ -w "$SPOOL_ROOT" ]; then ok "$SPOOL_ROOT escribible por el usuario actual"; else warn "$SPOOL_ROOT no es escribible por el usuario actual"; fi
+
+USED=$(df -P "$SPOOL_ROOT" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')
+if [[ "$USED" =~ ^[0-9]+$ ]]; then
+    FREE=$((100 - USED))
+    if [ "$USED" -lt "$SPOOL_WARN_PERCENT" ]; then
+        ok "Espacio libre en spool: ${FREE}%"
+    elif [ "$USED" -lt "$SPOOL_FAIL_PERCENT" ]; then
+        warn "Espacio libre en spool: ${FREE}%"
+    else
+        fail "Espacio libre crítico en spool: ${FREE}%"
+    fi
+else
+    warn "No se pudo determinar espacio del spool"
+fi
+
+section "BASE DE DATOS Y CDR"
+
+if [ -r "$DB_CNF" ]; then ok "Archivo de conexión presente"; else fail "No se puede leer $DB_CNF"; fi
+
+DB_TEST=$(mariadb --defaults-extra-file="$DB_CNF" --batch --skip-column-names -e 'SELECT 1;' 2>/dev/null || true)
+if [ "$DB_TEST" = '1' ]; then ok "Conexión MariaDB correcta"; else fail "No se pudo conectar a MariaDB"; fi
+
+LAST_CDR=$(mariadb --defaults-extra-file="$DB_CNF" --batch --skip-column-names -e "SELECT CONCAT(ID,'|',calldate) FROM ${DB_NAME}.cdr ORDER BY calldate DESC LIMIT 1;" 2>/dev/null || true)
+if [ -n "$LAST_CDR" ]; then
+    ok "Último CDR: ID ${LAST_CDR%%|*}, ${LAST_CDR#*|}"
+else
+    warn "No se encontraron CDR en la base"
+fi
+
+RECENT_CDR=$(mariadb --defaults-extra-file="$DB_CNF" --batch --skip-column-names -e "SELECT COUNT(*) FROM ${DB_NAME}.cdr WHERE calldate >= NOW() - INTERVAL ${RECENT_CDR_MINUTES} MINUTE;" 2>/dev/null || echo 0)
+if [[ "$RECENT_CDR" =~ ^[0-9]+$ ]] && [ "$RECENT_CDR" -gt 0 ]; then
+    ok "CDR nuevos en últimos ${RECENT_CDR_MINUTES} minutos: $RECENT_CDR"
+else
+    warn "No hay CDR nuevos en los últimos ${RECENT_CDR_MINUTES} minutos"
+fi
+
+section "VOIPMONITOR"
+
+if grep -Eq "^[[:space:]]*interface[[:space:]]*=[[:space:]]*$SPAN_IF" "$VOIPMONITOR_CONF" 2>/dev/null; then ok "Captura configurada en $SPAN_IF"; else fail "VoIPmonitor no está configurado para capturar en $SPAN_IF"; fi
+if grep -Eq "^[[:space:]]*spooldir[[:space:]]*=[[:space:]]*$SPOOL_ROOT" "$VOIPMONITOR_CONF" 2>/dev/null; then ok "spooldir correcto"; else fail "spooldir de VoIPmonitor no coincide con $SPOOL_ROOT"; fi
+
+if timeout "$SPAN_TRAFFIC_TIMEOUT" tcpdump -ni "$SPAN_IF" -c 1 >/dev/null 2>&1; then ok "Se detecta tráfico real en $SPAN_IF"; else warn "No se detectó tráfico en $SPAN_IF durante ${SPAN_TRAFFIC_TIMEOUT}s"; fi
+
+section "HERRAMIENTAS"
+
+for cmd in tcpdump tshark ffmpeg ffprobe setfacl flock xxd awk; do
+    if command -v "$cmd" >/dev/null 2>&1; then ok "$cmd disponible"; else fail "$cmd NO disponible"; fi
+done
+
+if ffmpeg -decoders 2>/dev/null | grep -qi g729; then ok "FFmpeg tiene decoder G.729"; else fail "FFmpeg NO tiene decoder G.729"; fi
+
+printf '\n==============================================================\n'
+if [ "$FAIL" -gt 0 ]; then
+    printf ' ESTADO GENERAL: REQUIERE ATENCION\n Fallas:       %s\n Advertencias: %s\n' "$FAIL" "$WARN"
+    STATUS=2
+elif [ "$WARN" -gt 0 ]; then
+    printf ' ESTADO GENERAL: OPERATIVO\n Advertencias: %s\n' "$WARN"
+    STATUS=1
+else
+    printf ' ESTADO GENERAL: OPERATIVO\n Advertencias: 0\n'
+    STATUS=0
+fi
+printf '==============================================================\n\n'
+exit "$STATUS"
